@@ -137,6 +137,9 @@ def _save_model(
     if getattr(config, "eagle3", False):
         model = _add_eagle3_mode_to_rt_info(model)
 
+    if getattr(config, "dflash", False):
+        model = _add_dflash_mode_to_rt_info(model)
+
     save_model(model, path, compress_to_fp16)
     del model
     gc.collect()
@@ -863,6 +866,19 @@ def _add_eagle3_mode_to_rt_info(model: Model):
     """
     try:
         model.set_rt_info("True", ["eagle3_mode"])
+    except Exception:
+        pass
+
+    return model
+
+
+def _add_dflash_mode_to_rt_info(model: Model):
+    """
+    Add DFlash mode marker to model rt_info.
+    This indicates the model is a DFlash draft model for block diffusion speculative decoding.
+    """
+    try:
+        model.set_rt_info("True", ["dflash_mode"])
     except Exception:
         pass
 

@@ -152,6 +152,20 @@ def update_config_for_eagle3(config):
     return config
 
 
+def update_config_for_dflash(config):
+    """Update config to load DFlash draft models for export.
+
+    DFlash models use a custom architecture (DFlashDraftModel) with
+    cross-attention between target hidden states and noise embeddings.
+    The model is based on Qwen3 but with non-causal attention.
+
+    Note: The ``--trust-remote-code`` CLI flag must be passed when exporting
+    DFlash models so that the custom HuggingFace model code is loaded.
+    """
+    config.dflash = True
+    return config
+
+
 def infer_library_name(
     model_name_or_path: str,
     subfolder: str = "",
@@ -320,6 +334,10 @@ def main_export(
         archs = getattr(config, "architectures", None)
         if isinstance(archs, list) and len(archs) > 0 and archs[0] == "LlamaForCausalLMEagle3":
             loading_kwargs["config"] = update_config_for_eagle3(config)
+
+        # update config to load DFlash draft models
+        if isinstance(archs, list) and len(archs) > 0 and archs[0] == "DFlashDraftModel":
+            loading_kwargs["config"] = update_config_for_dflash(config)
 
         # mxfp4 quantized model will be dequantized to bf16
         if quant_method == "mxfp4" and is_transformers_version(">=", "4.55"):

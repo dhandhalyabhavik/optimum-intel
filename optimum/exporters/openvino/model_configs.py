@@ -396,6 +396,34 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
     _MODEL_PATCHER = OVDecoderModelPatcher
 
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        task: str = "text-generation",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        use_past: bool = False,
+        use_past_in_inputs: bool = False,
+        preprocessors: list[Any] | None = None,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            use_past=use_past,
+            use_past_in_inputs=use_past_in_inputs,
+            preprocessors=preprocessors,
+        )
+        archs = getattr(config, "architectures", None)
+        self.dflash = False
+        if isinstance(archs, list) and len(archs) > 0 and "dflash" in archs[0].lower():
+            self.DUMMY_INPUT_GENERATOR_CLASSES += (DFlashDummyGenerator,)
+            self.dflash = True
+            # Note: DFlash uses non-causal attention. OVDecoderModelPatcher
+            # (inherited via _MODEL_PATCHER) patches causal masks; verify
+            # that remote model code is not affected during tracing.
+
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         if self.task in ["feature-extraction"]:
@@ -405,6 +433,9 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
             }
         else:
             common_inputs = super().inputs
+        # DFlash model has additional target_hidden input
+        if self.dflash:
+            common_inputs["target_hidden"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
         return common_inputs
 
 
@@ -772,6 +803,40 @@ class Eagle3DummyGenerator(DummyInputGenerator):
             self.batch_size,
             self.sequence_length,
             self.hidden_size * 3,
+        )
+        return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+
+
+class DFlashDummyGenerator(DummyInputGenerator):
+    """
+    Dummy input generator for DFlash speculative decoding.
+
+    Produces synthetic `target_hidden` tensors that mimic the concatenated
+    hidden-state outputs from 5 intermediate layers of the target model,
+    as required by the DFlash draft model.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("target_hidden",)
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+        self.hidden_size = normalized_config.hidden_size
+        # DFlash extracts from 5 target layers (Qwen3-4B default; varies by model)
+        self.num_target_layers = 5
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        shape = (
+            self.batch_size,
+            self.sequence_length,
+            self.hidden_size * self.num_target_layers,
         )
         return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
 

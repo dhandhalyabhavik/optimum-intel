@@ -418,14 +418,24 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
         archs = getattr(config, "architectures", None)
         self.dflash = False
         if isinstance(archs, list) and len(archs) > 0 and "dflash" in archs[0].lower():
-            self.DUMMY_INPUT_GENERATOR_CLASSES += (DFlashDummyGenerator,)
+            # For DFlash, replace the default generators with DFlashDummyGenerator only
+            # since DFlash doesn't use input_ids and has different input shapes
+            self.DUMMY_INPUT_GENERATOR_CLASSES = (DFlashDummyGenerator,)
             self.dflash = True
-            # Note: DFlash uses non-causal attention. OVDecoderModelPatcher
-            # (inherited via _MODEL_PATCHER) patches causal masks; verify
-            # that remote model code is not affected during tracing.
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
+        if self.dflash:
+            # DFlash model takes noise_embedding (float) instead of input_ids (int)
+            # and target_hidden as cross-attention context
+            # position_ids covers ctx_len + noise_len for rotary embeddings
+            # No attention_mask needed - DFlash uses non-causal attention
+            common_inputs = {
+                "position_ids": {0: "batch_size", 1: "total_sequence_length"},
+                "noise_embedding": {0: "batch_size", 1: "noise_sequence_length", 2: "hidden_size"},
+                "target_hidden": {0: "batch_size", 1: "context_sequence_length", 2: "target_hidden_size"},
+            }
+            return common_inputs
         if self.task in ["feature-extraction"]:
             common_inputs = {
                 "input_ids": {0: "batch_size", 1: "sequence_length"},
@@ -433,9 +443,6 @@ class Qwen3OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
             }
         else:
             common_inputs = super().inputs
-        # DFlash model has additional target_hidden input
-        if self.dflash:
-            common_inputs["target_hidden"] = {0: "batch_size", 1: "sequence_length", 2: "hidden_size"}
         return common_inputs
 
 
@@ -811,12 +818,14 @@ class DFlashDummyGenerator(DummyInputGenerator):
     """
     Dummy input generator for DFlash speculative decoding.
 
-    Produces synthetic `target_hidden` tensors that mimic the concatenated
-    hidden-state outputs from 5 intermediate layers of the target model,
+    Produces synthetic `noise_embedding`, `target_hidden`, and `position_ids` tensors
     as required by the DFlash draft model.
+    - noise_embedding: float tensor [batch, seq_len, hidden_size] (replaces input_ids)
+    - target_hidden: float tensor [batch, seq_len, hidden_size * num_target_layers]
+    - position_ids: int tensor [batch, 2 * seq_len] (covers ctx + noise positions for rotary)
     """
 
-    SUPPORTED_INPUT_NAMES = ("target_hidden",)
+    SUPPORTED_INPUT_NAMES = ("noise_embedding", "target_hidden", "position_ids")
 
     def __init__(
         self,
@@ -829,16 +838,39 @@ class DFlashDummyGenerator(DummyInputGenerator):
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.hidden_size = normalized_config.hidden_size
-        # DFlash extracts from 5 target layers (Qwen3-4B default; varies by model)
-        self.num_target_layers = 5
+        # DFlash extracts from target layers (default 5 for Qwen3 models)
+        raw_config = getattr(normalized_config, "config", normalized_config)
+        dflash_config = getattr(raw_config, "dflash_config", {})
+        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        self.num_target_layers = len(target_layer_ids) if target_layer_ids else 5
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
-        shape = (
-            self.batch_size,
-            self.sequence_length,
-            self.hidden_size * self.num_target_layers,
-        )
-        return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        if input_name == "noise_embedding":
+            shape = (
+                self.batch_size,
+                self.sequence_length,
+                self.hidden_size,
+            )
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        elif input_name == "target_hidden":
+            shape = (
+                self.batch_size,
+                self.sequence_length,
+                self.hidden_size * self.num_target_layers,
+            )
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+        elif input_name == "position_ids":
+            # position_ids must cover ctx_len + noise_len for rotary embeddings
+            # in attention, keys are concat of target_hidden (ctx) and noise (q)
+            total_len = self.sequence_length * 2
+            return self.random_int_tensor(
+                (self.batch_size, total_len),
+                max_value=total_len,
+                framework=framework,
+                dtype=int_dtype,
+            )
+        else:
+            raise ValueError(f"Unsupported input: {input_name}")
 
 
 @register_in_tasks_manager(

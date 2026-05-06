@@ -162,6 +162,12 @@ def update_config_for_dflash(config):
     Note: The ``--trust-remote-code`` CLI flag must be passed when exporting
     DFlash models so that the custom HuggingFace model code is loaded.
     """
+    # Ensure AutoModelForCausalLM also maps to the DFlash model class
+    # so that TasksManager loads the correct custom model for text-generation task
+    auto_map = getattr(config, "auto_map", {})
+    if "AutoModelForCausalLM" not in auto_map and "AutoModel" in auto_map:
+        auto_map["AutoModelForCausalLM"] = auto_map["AutoModel"]
+        config.auto_map = auto_map
     config.dflash = True
     return config
 
